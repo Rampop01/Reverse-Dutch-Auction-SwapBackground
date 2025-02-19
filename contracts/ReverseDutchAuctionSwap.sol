@@ -1,157 +1,129 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 // import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
-contract ReverseDutchAuctionSwap {
-    // Custom errors
-    error InvalidTokenAmount();
-    error InvalidPrices();
-    error InvalidDuration();
-    error TokenTransferFailed();
-    error AuctionNotActive();
-    error AuctionAlreadyFinalized();
-    error AuctionEnded();
-    error InsufficientPayment();
-    error UnauthorizedCancellation();
-    error InvalidAuctionId();
-
+contract ReverseDutchAuctionSwap{
     struct Auction {
         address seller;
-        address tokenAddress;
-        uint256 tokenAmount;
-        uint256 startPrice;
-        uint256 endPrice;
+        IERC20 token;
+        uint256 initialPrice;
         uint256 startTime;
-        uint256 endTime;
+        uint256 duration;
+        uint256 decayRate;
+        uint256 amount;
         bool active;
-        bool finalized;
     }
 
     mapping(uint256 => Auction) public auctions;
-    uint256 public auctionCounter;
+    uint256 public auctionCount = 0;
 
     event AuctionCreated(
         uint256 indexed auctionId,
         address indexed seller,
-        address tokenAddress,
-        uint256 tokenAmount,
-        uint256 startPrice,
-        uint256 endPrice,
-        uint256 startTime,
-        uint256 endTime
+        address token,
+        uint256 initialPrice,
+        uint256 duration,
+        uint256 decayRate,
+        uint256 amount
     );
     event AuctionFinalized(
         uint256 indexed auctionId,
         address indexed buyer,
         uint256 finalPrice
     );
+    event AuctionCancelled(uint256 indexed auctionId);
 
     function createAuction(
-        address _tokenAddress,
-        uint256 _tokenAmount,
-        uint256 _startPrice,
-        uint256 _endPrice,
-        uint256 _duration
+        address token,
+        uint256 initialPrice,
+        uint256 duration,
+        uint256 decayRate,
+        uint256 amount
     ) external returns (uint256) {
-        if (_tokenAmount == 0) revert InvalidTokenAmount();
-        if (_startPrice <= _endPrice) revert InvalidPrices();
-        if (_duration == 0) revert InvalidDuration();
-        if (_tokenAddress == address(0)) revert InvalidTokenAmount();
+        require(initialPrice > 0, "Invalid initial price");
+        require(duration > 0, "Invalid duration");
+        require(decayRate > 0, "Invalid decay rate");
+        require(amount > 0, "Invalid amount");
+        require(initialPrice > duration * decayRate, "Price would reach zero");
 
-        IERC20 token = IERC20(_tokenAddress);
-        if (!token.transferFrom(msg.sender, address(this), _tokenAmount)) {
-            revert TokenTransferFailed();
-        }
-
-        uint256 auctionId = auctionCounter++;
-        uint256 startTime = block.timestamp;
-        uint256 endTime = startTime + _duration;
-
+        IERC20(token).transferFrom(msg.sender, address(this), amount);
+        
+        uint256 auctionId = auctionCount++;
         auctions[auctionId] = Auction({
             seller: msg.sender,
-            tokenAddress: _tokenAddress,
-            tokenAmount: _tokenAmount,
-            startPrice: _startPrice,
-            endPrice: _endPrice,
-            startTime: startTime,
-            endTime: endTime,
-            active: true,
-            finalized: false
+            token: IERC20(token),
+            initialPrice: initialPrice,
+            startTime: block.timestamp,
+            duration: duration,
+            decayRate: decayRate,
+            amount: amount,
+            active: true
         });
 
         emit AuctionCreated(
             auctionId,
             msg.sender,
-            _tokenAddress,
-            _tokenAmount,
-            _startPrice,
-            _endPrice,
-            startTime,
-            endTime
+            token,
+            initialPrice,
+            duration,
+            decayRate,
+            amount
         );
 
         return auctionId;
     }
 
-    function getCurrentPrice(uint256 _auctionId) public view returns (uint256) {
-        if (_auctionId >= auctionCounter) revert InvalidAuctionId();
-        Auction storage auction = auctions[_auctionId];
-        if (!auction.active) revert AuctionNotActive();
-
-        if (block.timestamp >= auction.endTime) {
-            return auction.endPrice;
-        }
-
-        uint256 elapsed = block.timestamp - auction.startTime;
-        uint256 duration = auction.endTime - auction.startTime;
-        uint256 priceDiff = auction.startPrice - auction.endPrice;
+    function getCurrentPrice(uint256 auctionId) public view returns (uint256) {
+        Auction storage auction = auctions[auctionId];
+        require(auction.active, "Auction not active");
         
-        return auction.startPrice - (priceDiff * elapsed / duration);
+        uint256 elapsedTime = block.timestamp - auction.startTime;
+        if (elapsedTime >= auction.duration) {
+            return 0;
+        }
+        
+        uint256 priceDrop = elapsedTime * auction.decayRate;
+        if (priceDrop >= auction.initialPrice) {
+            return 0;
+        }
+        
+        return auction.initialPrice - priceDrop;
     }
 
-    function executeSwap(uint256 _auctionId) external payable {
-        if (_auctionId >= auctionCounter) revert InvalidAuctionId();
-        Auction storage auction = auctions[_auctionId];
-        if (!auction.active) revert AuctionNotActive();
-        if (auction.finalized) revert AuctionAlreadyFinalized();
-        if (block.timestamp > auction.endTime) revert AuctionEnded();
-
-        uint256 currentPrice = getCurrentPrice(_auctionId);
-        if (msg.value < currentPrice) revert InsufficientPayment();
+    function buy(uint256 auctionId) external payable {
+        Auction storage auction = auctions[auctionId];
+        require(auction.active, "Auction not active");
+        
+        uint256 currentPrice = getCurrentPrice(auctionId);
+        require(currentPrice > 0, "Auction expired");
+        require(msg.value >= currentPrice, "Insufficient payment");
 
         auction.active = false;
-        auction.finalized = true;
-
-        // Transfer tokens to buyer
-        if (!IERC20(auction.tokenAddress).transfer(msg.sender, auction.tokenAmount)) {
-            revert TokenTransferFailed();
-        }
-
+        
+        // Transfer token to buyer
+        auction.token.transfer(msg.sender, auction.amount);
+        
         // Transfer ETH to seller
-        uint256 excess = msg.value - currentPrice;
-        if (excess > 0) {
-            payable(msg.sender).transfer(excess);
-        }
         payable(auction.seller).transfer(currentPrice);
+        
+        // Refund excess payment
+        if (msg.value > currentPrice) {
+            payable(msg.sender).transfer(msg.value - currentPrice);
+        }
 
-        emit AuctionFinalized(_auctionId, msg.sender, currentPrice);
+        emit AuctionFinalized(auctionId, msg.sender, currentPrice);
     }
 
-    function cancelAuction(uint256 _auctionId) external {
-        if (_auctionId >= auctionCounter) revert InvalidAuctionId();
-        Auction storage auction = auctions[_auctionId];
-        if (msg.sender != auction.seller) revert UnauthorizedCancellation();
-        if (!auction.active) revert AuctionNotActive();
-        if (auction.finalized) revert AuctionAlreadyFinalized();
+    function cancelAuction(uint256 auctionId) external {
+        Auction storage auction = auctions[auctionId];
+        require(msg.sender == auction.seller, "Not seller");
+        require(auction.active, "Auction not active");
 
         auction.active = false;
-        auction.finalized = true;
+        auction.token.transfer(auction.seller, auction.amount);
 
-        // Return tokens to seller
-        if (!IERC20(auction.tokenAddress).transfer(auction.seller, auction.tokenAmount)) {
-            revert TokenTransferFailed();
-        }
+        emit AuctionCancelled(auctionId);
     }
 }
